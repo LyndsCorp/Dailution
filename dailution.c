@@ -1,13 +1,18 @@
 /*
  * Dailution - Shell de comandos mínima (sin scripting)
- * Ejecuta comandos externos directamente, sin shell intermedio.
+ * Versión: 1.1
+ * Autor:  David Baña Szymaniak
+ * Desc:   Ejecuta comandos externos directamente, sin shell
+ *
  * Soporta tuberías, redirecciones, operadores lógicos, trabajos en segundo plano,
  * edición de línea con flechas e historial en RAM (sin bibliotecas externas).
  * Expande variables ($VAR, ${VAR}, $?, $$) y la tilde (~).
  * Carga configuración desde ~/.dailutionrc (lo crea si no existe con datos reales).
  * Ctrl+Z mata el proceso en primer plano (SIGKILL).
  * Ctrl+C durante la ejecución va al proceso hijo, no al shell.
+ *
  * Built‑ins: cd, exit.
+ * Uso: ./dailution [opción] [comando ...] o sin argumentos entras al shell.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -25,6 +30,13 @@
 #include <termios.h>
 #include <pwd.h>
 #include <grp.h>
+
+/* ---------------------------------------------------------------------------
+ * Variables del proyecto (visibles con --version / --edition)
+ * --------------------------------------------------------------------------- */
+#define VERSION         "1.1"
+#define AUTHOR          "David Baña Szymaniak"
+#define DESCRIPTION     "Dailution: shell mínima para ejecutar comandos."
 
 /* ---------------------------------------------------------------------------
  * Estructuras de datos del shell
@@ -83,8 +95,6 @@ static void hist_free(void) {
     hist_count = 0;
 }
 
-/* Lee una línea con edición básica usando termios.
- *  Desactiva ISIG para manejar Ctrl+C manualmente. */
 static char *leer_linea(const char *prompt) {
     struct termios viejo, nuevo;
     tcgetattr(STDIN_FILENO, &viejo);
@@ -204,6 +214,12 @@ static char *leer_linea(const char *prompt) {
         for (int i = len - pos; i > 0; i--) write(STDOUT_FILENO, "\b", 1);
     }
 
+    /* CORRECCIÓN: si se pulsó Enter sin escribir nada, devolvemos cadena vacía */
+    if (!buf) {
+        buf = strdup("");
+        if (!buf) { perror("strdup"); exit(1); }
+    }
+
     tcsetattr(STDIN_FILENO, TCSANOW, &viejo);
     return buf;
 }
@@ -275,7 +291,8 @@ static void add_token(int type, const char *word) {
 
 static void free_tokens(void) {
     for (int i = 0; i < tok_count; i++) free(tokens[i].word);
-    free(tokens); tokens = NULL; tok_count = 0; tok_cap = 0;
+    free(tokens);
+    tokens = NULL; tok_count = 0; tok_cap = 0;
 }
 
 static int tokenize(const char *line) {
@@ -461,7 +478,7 @@ static void free_cmdlist(CmdList *list) {
 /* ---------------------------------------------------------------------------
  * Ejecución (con manejo de terminal y Ctrl+Z -> SIGKILL)
  * --------------------------------------------------------------------------- */
-static struct termios term_orig;  /* configuración original del terminal */
+static struct termios term_orig;
 
 static void exec_cmd(SimpleCmd *cmd) {
     if (cmd->infile) {
@@ -518,15 +535,10 @@ static int execute_pipeline(Pipeline *p) {
         if (pid < 0) { perror("fork"); return 1; }
 
         if (pid == 0) {
-            /* Hijo: crear nuevo grupo de procesos y unirse al líder */
             if (i == 0) setpgid(0, 0);
             else setpgid(0, lider);
-
-            signal(SIGINT, SIG_DFL);
-            signal(SIGQUIT, SIG_DFL);
-            signal(SIGTSTP, SIG_DFL);  /* permitir que se detenga con Ctrl+Z */
+            signal(SIGINT, SIG_DFL); signal(SIGQUIT, SIG_DFL); signal(SIGTSTP, SIG_DFL);
             signal(SIGTTOU, SIG_DFL);
-
             if (in_fd != STDIN_FILENO) { dup2(in_fd, STDIN_FILENO); close(in_fd); }
             if (out_fd != STDOUT_FILENO) { dup2(out_fd, STDOUT_FILENO); close(out_fd); }
             if (pipes[0][0] != -1) { close(pipes[0][0]); close(pipes[0][1]); }
@@ -535,12 +547,8 @@ static int execute_pipeline(Pipeline *p) {
         }
 
         pids[i] = pid;
-        if (i == 0) {
-            lider = pid;
-            setpgid(pid, pid);  /* por si el hijo aún no lo hizo */
-        } else {
-            setpgid(pid, lider);
-        }
+        if (i == 0) { lider = pid; setpgid(pid, pid); }
+        else setpgid(pid, lider);
 
         if (i < n - 1) close(pipes[1][1]);
         if (i > 0) { close(pipes[0][0]); close(pipes[0][1]); }
@@ -548,37 +556,29 @@ static int execute_pipeline(Pipeline *p) {
         else in_fd = STDIN_FILENO;
     }
 
-    /* Si no es background, ceder terminal al grupo del pipeline */
     if (!p->background) {
         tcsetpgrp(STDIN_FILENO, lider);
-        tcsetattr(STDIN_FILENO, TCSANOW, &term_orig);  /* restaurar señales del terminal */
+        tcsetattr(STDIN_FILENO, TCSANOW, &term_orig);
     }
 
     int status = 0;
     for (int i = 0; i < n; i++) {
         int wstatus;
-        /* esperar con WUNTRACED para detectar Ctrl+Z */
         while (waitpid(pids[i], &wstatus, WUNTRACED) == -1 && errno == EINTR);
 
         if (WIFSTOPPED(wstatus)) {
-            /* El proceso se detuvo (Ctrl+Z). Lo matamos con SIGKILL. */
             kill(pids[i], SIGKILL);
-            /* esperar su terminación real */
             waitpid(pids[i], &wstatus, 0);
         }
 
         if (i == n - 1) {
-            if (WIFEXITED(wstatus))
-                status = WEXITSTATUS(wstatus);
-            else if (WIFSIGNALED(wstatus))
-                status = 128 + WTERMSIG(wstatus);
+            if (WIFEXITED(wstatus)) status = WEXITSTATUS(wstatus);
+            else if (WIFSIGNALED(wstatus)) status = 128 + WTERMSIG(wstatus);
         }
     }
 
-    /* Recuperar el control del terminal */
     if (!p->background) {
         tcsetpgrp(STDIN_FILENO, getpgrp());
-        /* No restauramos termios aquí, lo hará leer_linea */
     }
 
     return status;
@@ -693,6 +693,32 @@ static void cargar_rc(const char *rcpath) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Ayuda del programa
+ * --------------------------------------------------------------------------- */
+static void mostrar_ayuda(void) {
+    printf("Uso: dailution [opción] [comando ...]\n\n");
+    printf("Opciones:\n");
+    printf("  --version   Muestra solo el número de versión\n");
+    printf("  --edition   Muestra información completa del proyecto\n");
+    printf("  --help      Muestra esta ayuda\n");
+    printf("  -c          Ejecuta el comando proporcionado (compatible POSIX)\n\n");
+    printf("Si se invoca sin argumentos, inicia la shell interactiva.\n");
+    printf("Si se proporciona un comando (o varios), lo ejecuta y termina.\n");
+    printf("Ejemplos:\n");
+    printf("  dailution -c \"ls -la\"\n");
+    printf("  dailution echo Hola mundo\n\n");
+    printf("Características:\n");
+    printf("  Tuberías (|), redirecciones (>, <, >>, 2>, 2>>)\n");
+    printf("  Operadores lógicos (&&, ||), punto y coma (;)\n");
+    printf("  Trabajos en segundo plano (&)\n");
+    printf("  Expansión de variables ($VAR, ${VAR}, $?, $$) y tilde (~)\n");
+    printf("  Historial en RAM (flechas arriba/abajo)\n");
+    printf("  Built‑ins: cd, exit\n");
+    printf("  Ctrl+C limpia la línea actual, Ctrl+Z mata el proceso en primer plano\n");
+    printf("  Carga configuración desde ~/.dailutionrc\n");
+}
+
+/* ---------------------------------------------------------------------------
  * Señales
  * --------------------------------------------------------------------------- */
 static volatile sig_atomic_t interrupted = 0;
@@ -702,7 +728,6 @@ static void sigint_handler(int sig) { (void)sig; interrupted = 1; }
  * main
  * --------------------------------------------------------------------------- */
 int main(int argc, char **argv) {
-    /* Guardar configuración original del terminal */
     tcgetattr(STDIN_FILENO, &term_orig);
 
     struct sigaction sa;
@@ -714,7 +739,29 @@ int main(int argc, char **argv) {
     signal(SIGQUIT, SIG_IGN);
     signal(SIGTTOU, SIG_IGN);
 
-    /* Crear nuestro propio grupo de procesos y tomar el terminal */
+    /* ── Opciones especiales antes de cualquier otra cosa ── */
+    if (argc > 1) {
+        if (strcmp(argv[1], "--version") == 0) {
+            puts(VERSION);
+            return 0;
+        }
+        if (strcmp(argv[1], "--edition") == 0) {
+            printf("Dailution %s\n", VERSION);
+            printf("Autor: %s\n", AUTHOR);
+            printf("Descripción: %s\n", DESCRIPTION);
+            printf("Compilado: %s %s\n", __DATE__, __TIME__);
+            return 0;
+        }
+        if (strcmp(argv[1], "--help") == 0) {
+            mostrar_ayuda();
+            return 0;
+        }
+    }
+
+    /* Exportar variable DAILUTION_VERSION */
+    setenv("DAILUTION_VERSION", VERSION, 1);
+
+    /* Tomar control del terminal */
     if (isatty(STDIN_FILENO)) {
         setpgid(0, 0);
         tcsetpgrp(STDIN_FILENO, getpgrp());
@@ -734,17 +781,36 @@ int main(int argc, char **argv) {
     if (!getenv("TERM")) setenv("TERM", "xterm-256color", 0);
 
     if (argc > 1) {
-        size_t total_len = 0;
-        for (int i = 1; i < argc; i++) total_len += strlen(argv[i]) + 1;
-        char *cmdline = malloc(total_len + 1); cmdline[0] = '\0';
-        for (int i = 1; i < argc; i++) { if (i > 1) strcat(cmdline, " "); strcat(cmdline, argv[i]); }
-        if (tokenize(cmdline) != 0) { fprintf(stderr, "Dailution: error de sintaxis\n"); free(cmdline); exit(1); }
-        free(cmdline);
-        CmdList *cmdlist = parse_cmd_list();
-        int ret = 0;
-        if (cmdlist) { ret = execute_cmdlist(cmdlist); free_cmdlist(cmdlist); }
-        free_tokens();
-        return ret;
+        int cmd_start = 1;             // índice del primer argumento del comando
+        if (strcmp(argv[1], "-c") == 0) {
+            cmd_start = 2;             // saltar el -c
+        }
+        if (cmd_start < argc) {
+            // Construir línea de comando a partir de los argumentos restantes
+            size_t total_len = 0;
+            for (int i = cmd_start; i < argc; i++) total_len += strlen(argv[i]) + 1;
+            char *cmdline = malloc(total_len + 1);
+            cmdline[0] = '\0';
+            for (int i = cmd_start; i < argc; i++) {
+                if (i > cmd_start) strcat(cmdline, " ");
+                strcat(cmdline, argv[i]);
+            }
+            if (tokenize(cmdline) != 0) {
+                fprintf(stderr, "Dailution: error de sintaxis\n");
+                free(cmdline);
+                exit(1);
+            }
+            free(cmdline);
+            CmdList *cmdlist = parse_cmd_list();
+            int ret = 0;
+            if (cmdlist) { ret = execute_cmdlist(cmdlist); free_cmdlist(cmdlist); }
+            free_tokens();
+            return ret;
+        } else {
+            // -c sin comando
+            fprintf(stderr, "Dailution: -c requiere un comando\n");
+            return 1;
+        }
     }
 
     const char *home_dir = getenv("HOME");
