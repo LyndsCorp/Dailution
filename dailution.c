@@ -1,6 +1,6 @@
 /*
  * Dailution - Shell de comandos mínima (sin scripting)
- * Versión: 1.1
+ * Versión: 1.0
  * Autor:  David Baña Szymaniak
  * Desc:   Ejecuta comandos externos directamente, sin shell
  *
@@ -34,7 +34,7 @@
 /* ---------------------------------------------------------------------------
  * Variables del proyecto (visibles con --version / --edition)
  * --------------------------------------------------------------------------- */
-#define VERSION         "1.1"
+#define VERSION         "1.0"
 #define AUTHOR          "David Baña Szymaniak"
 #define DESCRIPTION     "Dailution: shell mínima para ejecutar comandos."
 
@@ -819,7 +819,7 @@ int main(int argc, char **argv) {
     crear_rc_si_no_existe(rcpath);
     cargar_rc(rcpath);
 
-    printf("Dailution - shell mínima (escriba 'exit' para salir)\n");
+    printf("Dailution - shell mínima (escribe 'exit' para salir)\n");
     while (1) {
         reap_background();
         if (interrupted) { putchar('\n'); interrupted = 0; }
